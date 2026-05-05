@@ -66,4 +66,4 @@ Module-level `ffmpegInstance`/`ffmpegLoaded` vars ensure a single FFmpeg instanc
 
 ### Output
 
-Each input file → its own ZIP (`<basename>_uniqualized.zip`) with N copies named `<basename>_uq1.ext` … `_uqN.ext`. ZIPs trigger as sequential browser downloads with 400 ms delay between them.
+Each input file → its own ZIP (`<basename>_uniqualized.zip`) with N copies named `<basename>_uq1.ext` … `_uqN.ext`. Each ZIP is downloaded immediately after its file finishes processing — no waiting for the full queue. A 400 ms delay separates consecutive downloads.
