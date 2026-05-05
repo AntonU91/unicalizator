@@ -1,12 +1,28 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { toBlobURL, fetchFile } from "@ffmpeg/util";
 import JSZip from "jszip";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 let fileCounter = 0;
 function uniqueName(prefix, extension) {
   return `${prefix}_${++fileCounter}${extension}`;
+}
+
+// Loads a script tag once; resolves immediately if already loaded
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing?.dataset.loaded) { resolve(); return; }
+    existing?.remove();
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => { s.dataset.loaded = "1"; resolve(); };
+    s.onerror = () => { s.remove(); reject(new Error(`Failed to load: ${src}`)); };
+    document.head.appendChild(s);
+  });
+}
+
+async function fetchFile(file) {
+  return new Uint8Array(await file.arrayBuffer());
 }
 
 let ffmpegInstance = null;
@@ -17,13 +33,18 @@ async function getFFmpeg(onProgress) {
   if (onProgress) currentProgressCb = onProgress;
   if (ffmpegLoaded && ffmpegInstance) return ffmpegInstance;
 
+  // Use UMD build (classic Worker) — ESM build uses module Worker which
+  // breaks importScripts() and prevents loading the UMD ffmpeg-core.
+  const base = window.location.origin;
+  await loadScript(`${base}/ffmpeg.js`);
+
+  const { FFmpeg } = window.FFmpegWASM;
   const ff = new FFmpeg();
   ff.on("progress", (p) => { if (currentProgressCb) currentProgressCb(p); });
 
-  const base = window.location.origin;
   await ff.load({
-    coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"),
-    wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"),
+    coreURL: `${base}/ffmpeg-core.js`,
+    wasmURL: `${base}/ffmpeg-core.wasm`,
   });
 
   ffmpegInstance = ff;
@@ -166,7 +187,8 @@ export default function App() {
     setError("");
     getFFmpeg(() => {})
       .then(() => { setFfmpegReady(true); setFfmpegLoading(false); })
-      .catch(() => {
+      .catch((err) => {
+        console.error("ffmpeg load failed:", err);
         setFfmpegError(true);
         setFfmpegLoading(false);
         ffmpegLoadedRef.current = false;
