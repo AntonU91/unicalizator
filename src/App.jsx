@@ -237,7 +237,6 @@ export default function App() {
 
     try {
       let current = 0;
-      const zips = [];
 
       for (const creative of creatives) {
         const zip = new JSZip();
@@ -267,13 +266,9 @@ export default function App() {
         }
 
         const zipBlob = await zip.generateAsync({ type: "blob" });
-        zips.push({ name: `${name}_uniqualized.zip`, blob: zipBlob });
-      }
-
-      for (const z of zips) {
         const a = document.createElement("a");
-        a.href = URL.createObjectURL(z.blob);
-        a.download = z.name;
+        a.href = URL.createObjectURL(zipBlob);
+        a.download = `${name}_uniqualized.zip`;
         a.click();
         await new Promise(r => setTimeout(r, 400));
         URL.revokeObjectURL(a.href);
