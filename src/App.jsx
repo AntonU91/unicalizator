@@ -69,7 +69,7 @@ async function readDirEntry(dirEntry) {
       if (!entry.isFile) continue;
       const file = await new Promise((res, rej) => entry.file(res, rej));
       if (!file.type.startsWith("image/") && !file.type.startsWith("video/")) continue;
-      files.push({ name: entry.name, handle: { getFile: () => Promise.resolve(file) } });
+      files.push({ name: entry.name, handle: { getFile: () => Promise.resolve(file) }, type: file.type });
     }
   } while (batch.length > 0);
   files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
@@ -269,6 +269,15 @@ export default function App() {
   const cancelRef    = useRef(false);
   const batchDropRef = useRef(null);
 
+  // ── Folder-dupes state (uniqualize tab) ──
+  const [folderDir, setFolderDir]             = useState(null); // { name, files: [{name, handle, type}] }
+  const [folderDupes, setFolderDupes]         = useState(1);
+  const [folderProcessing, setFolderProcessing] = useState(false);
+  const [folderProgress, setFolderProgress]   = useState({ current: 0, total: 0, label: "", videoPct: 0 });
+  const [folderDone, setFolderDone]           = useState(false);
+  const [folderError, setFolderError]         = useState("");
+  const folderDropRef = useRef(null);
+
   // ── Batch tab state ──
   const [batchDirs, setBatchDirs]             = useState([]);
   const [batchIters, setBatchIters]           = useState(1);
@@ -278,6 +287,7 @@ export default function App() {
   const [batchError, setBatchError]           = useState("");
 
   const hasVideos = creatives.some(c => isVideo(c.file));
+  const folderHasVideos = folderDir?.files.some(f => f.type.startsWith("video/")) ?? false;
 
   const loadFfmpeg = useCallback(() => {
     if (ffmpegLoadedRef.current) return;
@@ -305,6 +315,11 @@ export default function App() {
     loadFfmpeg();
   }, [compFiles.length, loadFfmpeg]);
 
+  useEffect(() => {
+    if (!folderHasVideos || ffmpegLoadedRef.current) return;
+    loadFfmpeg();
+  }, [folderHasVideos, loadFfmpeg]);
+
   const addFiles = useCallback((files) => {
     const arr = Array.from(files).filter(f => isImage(f) || isVideo(f));
     setCreatives(prev => [...prev, ...arr.map(f => ({
@@ -330,8 +345,8 @@ export default function App() {
 
   const handleProcess = async () => {
     if (!creatives.length) return;
-    if (compProcessing) {
-      setError("Дождись окончания сжатия на вкладке «Сжатие».");
+    if (compProcessing || folderProcessing || batchProcessing) {
+      setError("Дождись окончания обработки.");
       return;
     }
     if (hasVideos && !ffmpegReady) {
@@ -554,7 +569,7 @@ export default function App() {
   const handleBatchProcess = async () => {
     const validDirs = batchDirs.filter(d => d.files.length > 0);
     if (!validDirs.length) { setBatchError("Нет папок с медиафайлами."); return; }
-    if (processing || compProcessing) {
+    if (processing || compProcessing || folderProcessing) {
       setBatchError("Дождись окончания обработки на другой вкладке.");
       return;
     }
@@ -573,8 +588,7 @@ export default function App() {
           const idx = i % dir.files.length;
           const fileEntry = dir.files[idx];
           const file = await fileEntry.handle.getFile();
-          // di+1 гарантирует уникальность даже если две папки одноимённые
-          zip.file(`dir${di + 1}_${dir.name}_${fileEntry.name}`, file);
+          zip.file(`b${i + 1}_${fileEntry.name}`, file);
         }
         const blob = await zip.generateAsync({ type: "blob" });
         const url = URL.createObjectURL(blob);
@@ -591,6 +605,101 @@ export default function App() {
     }
     setBatchProcessing(false);
     setBatchProgress({ current: 0, total: 0 });
+  };
+
+  // ── Folder-dupes handlers ──
+  const handleFolderSelect = async () => {
+    if (!window.showDirectoryPicker) { setFolderError("Браузер не поддерживает выбор папок. Используй Chrome или Edge."); return; }
+    try {
+      const handle = await window.showDirectoryPicker({ mode: "read" });
+      const files = [];
+      for await (const [name, fh] of handle.entries()) {
+        if (fh.kind !== "file") continue;
+        const f = await fh.getFile();
+        if (!f.type.startsWith("image/") && !f.type.startsWith("video/")) continue;
+        files.push({ name, handle: fh, type: f.type });
+      }
+      files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+      setFolderDir({ name: handle.name, files });
+      setFolderDone(false);
+      setFolderError("");
+    } catch (e) {
+      if (e.name !== "AbortError") setFolderError("Ошибка: " + e.message);
+    }
+  };
+
+  const handleFolderDrop = async (e) => {
+    e.preventDefault();
+    folderDropRef.current?.classList.remove("drag-over");
+    const entries = Array.from(e.dataTransfer.items)
+      .map(item => item.webkitGetAsEntry?.())
+      .filter(entry => entry?.isDirectory);
+    if (!entries.length) { setFolderError("Перетащи папку, а не файлы."); return; }
+    setFolderError("");
+    try {
+      const files = await readDirEntry(entries[0]);
+      setFolderDir({ name: entries[0].name, files });
+      setFolderDone(false);
+    } catch (err) {
+      setFolderError("Ошибка чтения папки: " + err.message);
+    }
+  };
+
+  const handleFolderProcess = async () => {
+    if (!folderDir || !folderDir.files.length) { setFolderError("Папка пуста или не выбрана."); return; }
+    if (processing || compProcessing || batchProcessing) {
+      setFolderError("Дождись окончания обработки на другой вкладке.");
+      return;
+    }
+    if (folderHasVideos && !ffmpegReady) {
+      setFolderError(ffmpegError
+        ? "ffmpeg.wasm не загружен — нажми «Повторить» выше."
+        : "ffmpeg.wasm ещё загружается, подожди...");
+      return;
+    }
+    cancelRef.current = false;
+    setFolderProcessing(true);
+    setFolderDone(false);
+    setFolderError("");
+    setFolderProgress({ current: 0, total: folderDupes, label: "", videoPct: 0 });
+    try {
+      for (let d = 1; d <= folderDupes; d++) {
+        if (cancelRef.current) break;
+        setFolderProgress({ current: d, total: folderDupes, label: `Дубль ${d}/${folderDupes}`, videoPct: 0 });
+        const zip = new JSZip();
+        for (const fileEntry of folderDir.files) {
+          if (cancelRef.current) break;
+          const file = await fileEntry.handle.getFile();
+          let blob;
+          if (isImage(file)) {
+            blob = await uniqualizeImage(file);
+          } else if (isVideo(file)) {
+            blob = await uniqualizeVideo(file, d, (p) => {
+              setFolderProgress(prev => ({ ...prev, videoPct: Math.round((p.progress || 0) * 100) }));
+            });
+          } else {
+            continue;
+          }
+          const outExt = isVideo(file) ? ".mp4" : ext(file);
+          zip.file(`un${d}_${baseName(file)}${outExt}`, blob);
+        }
+        if (!cancelRef.current) {
+          const zipBlob = await zip.generateAsync({ type: "blob" });
+          const url = URL.createObjectURL(zipBlob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${folderDir.name}_dup${d}.zip`;
+          a.click();
+          if (d < folderDupes) await new Promise(r => setTimeout(r, 400));
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+      }
+      if (!cancelRef.current) setFolderDone(true);
+    } catch (e) {
+      if (!cancelRef.current) setFolderError("Ошибка: " + e.message);
+    }
+    setFolderProcessing(false);
+    setFolderProgress({ current: 0, total: 0, label: "", videoPct: 0 });
   };
 
   return (
@@ -646,7 +755,7 @@ export default function App() {
               <button style={S.retryBtn} onClick={loadFfmpeg}>↺ Повторить</button>
             </div>
           )}
-          {ffmpegReady && hasVideos && (
+          {ffmpegReady && (hasVideos || folderHasVideos) && (
             <div style={S.bannerGreen}>✅ ffmpeg.wasm готов — видео будет обработано полноценно</div>
           )}
 
@@ -676,7 +785,7 @@ export default function App() {
 
           {creatives.length > 0 && !processing && (
             <button
-              style={{ ...S.processBtn, opacity: (hasVideos && !ffmpegReady) || compProcessing ? 0.5 : 1, cursor: (hasVideos && !ffmpegReady) || compProcessing ? "not-allowed" : "pointer" }}
+              style={{ ...S.processBtn, opacity: (hasVideos && !ffmpegReady) || compProcessing || folderProcessing ? 0.5 : 1, cursor: (hasVideos && !ffmpegReady) || compProcessing || folderProcessing ? "not-allowed" : "pointer" }}
               onClick={handleProcess}
             >
               ⚡ Уникализировать и скачать ZIP
@@ -704,6 +813,82 @@ export default function App() {
 
           {done && <div style={S.done}>✅ Готово! ZIP-архивы скачаны. По одному архиву на каждый креатив.</div>}
           {error && <div style={S.errorBox}>⚠️ {error}</div>}
+
+          <div style={S.folderSectionDivider}>◈ ИЛИ УНИКАЛИЗИРОВАТЬ ПАПКУ ЦЕЛИКОМ</div>
+
+          <div
+            ref={folderDropRef}
+            style={{ ...S.dropZone, cursor: "default", ...(folderProcessing ? { opacity: 0.4, pointerEvents: "none" } : {}) }}
+            onDragOver={(e) => { e.preventDefault(); folderDropRef.current?.classList.add("drag-over"); }}
+            onDragLeave={() => folderDropRef.current?.classList.remove("drag-over")}
+            onDrop={handleFolderDrop}
+          >
+            <div style={S.dropIcon}>📁</div>
+            <p style={S.dropText}>Перетащи папку с материалами</p>
+            <p style={S.dropHint}>Все файлы в папке будут уникализированы</p>
+          </div>
+          <button
+            style={{ ...S.addDirBtn, ...(folderProcessing ? { opacity: 0.4, pointerEvents: "none" } : {}) }}
+            onClick={handleFolderSelect}
+          >
+            + Выбрать папку
+          </button>
+
+          {folderDir && (
+            <>
+              <div style={S.list}>
+                <div style={S.listHeader}>
+                  <span>📁 {folderDir.name} · {folderDir.files.length} файлов</span>
+                  {!folderProcessing && (
+                    <button style={S.clearBtn} onClick={() => { setFolderDir(null); setFolderDone(false); setFolderError(""); }}>✕</button>
+                  )}
+                </div>
+              </div>
+              <div style={{ ...S.itersWrap, ...(folderProcessing ? { opacity: 0.4, pointerEvents: "none" } : {}) }}>
+                <span style={S.itersLabel}>Дублей</span>
+                <button style={S.stepBtn} onClick={() => setFolderDupes(n => Math.max(1, n - 1))}>−</button>
+                <input
+                  type="number" min={1} max={99} value={folderDupes}
+                  onChange={e => setFolderDupes(Math.max(1, parseInt(e.target.value) || 1))}
+                  style={S.itersInput}
+                />
+                <button style={S.stepBtn} onClick={() => setFolderDupes(n => n + 1)}>+</button>
+                <span style={S.itersHint}>
+                  → {folderDupes} ZIP × {folderDir.files.length} файлов
+                </span>
+              </div>
+              {!folderProcessing && (
+                <button
+                  style={{ ...S.processBtn, opacity: (folderHasVideos && !ffmpegReady) || processing ? 0.5 : 1, cursor: (folderHasVideos && !ffmpegReady) || processing ? "not-allowed" : "pointer" }}
+                  onClick={handleFolderProcess}
+                >
+                  ⚡ Уникализировать папку
+                </button>
+              )}
+            </>
+          )}
+
+          {folderProcessing && (
+            <div style={S.progressWrap}>
+              <div style={S.progressLabel}>{folderProgress.label}</div>
+              <div style={S.progressBar}>
+                <div style={{ ...S.progressFill, width: `${folderProgress.total ? (folderProgress.current / folderProgress.total) * 100 : 0}%` }} />
+              </div>
+              <div style={S.progressCount}>{folderProgress.current} / {folderProgress.total}</div>
+              {folderProgress.videoPct > 0 && folderProgress.videoPct < 100 && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={S.progressLabel}>ffmpeg кодирует: {folderProgress.videoPct}%</div>
+                  <div style={S.progressBar}>
+                    <div style={{ ...S.progressFillGreen, width: `${folderProgress.videoPct}%` }} />
+                  </div>
+                </div>
+              )}
+              <button style={S.cancelBtn} onClick={handleCancel}>✕ Отменить</button>
+            </div>
+          )}
+
+          {folderDone  && <div style={S.done}>✅ Готово! {folderDupes} ZIP-архив{folderDupes === 1 ? "" : folderDupes < 5 ? "а" : "ов"} скачано.</div>}
+          {folderError && <div style={S.errorBox}>⚠️ {folderError}</div>}
 
           <div style={S.infoGrid}>
             {[
@@ -851,15 +1036,20 @@ export default function App() {
           <div
             ref={batchDropRef}
             style={{ ...S.dropZone, ...(batchProcessing ? { opacity: 0.4, pointerEvents: "none" } : {}) }}
-            onClick={handleAddDir}
             onDragOver={(e) => { e.preventDefault(); batchDropRef.current?.classList.add("drag-over"); }}
             onDragLeave={() => batchDropRef.current?.classList.remove("drag-over")}
             onDrop={handleDirDrop}
           >
-            <div style={S.dropIcon}>📁</div>
-            <p style={S.dropText}>Перетащи папки или <span style={S.link}>выбери папку</span></p>
-            <p style={S.dropHint}>Можно перетащить сразу несколько папок · Chrome / Edge</p>
+            <div style={S.dropIcon}>📂</div>
+            <p style={S.dropText}>Перетащи сюда несколько папок сразу</p>
+            <p style={S.dropHint}>Выдели папки в Finder / Проводнике и перетащи их сюда</p>
           </div>
+          <button
+            style={{ ...S.addDirBtn, ...(batchProcessing ? { opacity: 0.4, pointerEvents: "none" } : {}) }}
+            onClick={handleAddDir}
+          >
+            + Добавить папку по одной
+          </button>
 
           {batchDirs.length > 0 && (
             <div style={S.list}>
@@ -893,7 +1083,7 @@ export default function App() {
               />
               <button style={S.stepBtn} onClick={() => setBatchIters(n => n + 1)}>+</button>
               <span style={S.itersHint}>
-                → {batchIters * batchDirs.filter(d => d.files.length > 0).length} файлов в архиве
+                → {batchIters} архив{batchIters === 1 ? "" : batchIters < 5 ? "а" : "ов"} × {batchDirs.filter(d => d.files.length > 0).length} файлов
               </span>
             </div>
           )}
@@ -988,9 +1178,11 @@ const S = {
   customUnit: { fontSize: 12, color: "#4a4a6a" },
   warnBox: { padding: 14, background: "#1f1a0a", border: "1px solid #4a3a1a", borderRadius: 10, fontSize: 12, color: "#ffb300", marginBottom: 24, textAlign: "center", whiteSpace: "pre-line" },
   cancelBtn: { marginTop: 14, width: "100%", padding: "8px 0", background: "none", border: "1px solid #3a3a5a", color: "#6b6b8a", borderRadius: 8, cursor: "pointer", fontSize: 12, fontFamily: "'Courier New', monospace", letterSpacing: 1 },
+  addDirBtn: { width: "100%", padding: "10px 0", background: "none", border: "1px solid #2a2a4a", color: "#6b6b8a", borderRadius: 8, cursor: "pointer", fontSize: 12, fontFamily: "'Courier New', monospace", letterSpacing: 1, marginBottom: 16 },
   itersWrap: { display: "flex", alignItems: "center", gap: 8, marginBottom: 20, padding: "12px 16px", background: "#0f0f1a", borderRadius: 10, border: "1px solid #1e1e3a" },
   itersLabel: { fontSize: 12, color: "#6b6b8a", letterSpacing: 1, marginRight: 4 },
   itersInput: { width: 56, textAlign: "center", background: "#0a0a14", border: "1px solid #2a2a4a", color: "#e8e8f0", borderRadius: 6, padding: "3px 4px", fontSize: 13, fontFamily: "'Courier New', monospace" },
   itersHint: { fontSize: 12, color: "#7c4dff", marginLeft: 8 },
   batchHint: { textAlign: "center", color: "#4a4a6a", fontSize: 13, lineHeight: 1.8, marginTop: 32 },
+  folderSectionDivider: { textAlign: "center", fontSize: 10, color: "#2a2a4a", letterSpacing: 2, margin: "28px 0 20px", borderTop: "1px solid #1e1e3a", paddingTop: 20 },
 };
