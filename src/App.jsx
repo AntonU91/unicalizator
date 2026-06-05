@@ -129,8 +129,8 @@ async function compressVideo(file, targetBytes, onProgress) {
   const data = await ff.readFile(out);
   const blob = new Blob([new Uint8Array(data)], { type: "video/mp4" });
 
-  try { await ff.deleteFile(inp); } catch (_) {}
-  try { await ff.deleteFile(out); } catch (_) {}
+  try { await ff.deleteFile(inp); } catch { /* ignore */ }
+  try { await ff.deleteFile(out); } catch { /* ignore */ }
 
   return { blob, warning };
 }
@@ -153,13 +153,7 @@ async function uniqualizeImage(file) {
       canvas.width = w; canvas.height = h;
       const ctx = canvas.getContext("2d");
 
-      // Micro-rotation ±1.5°
-      const angle = randomBetween(-1.5, 1.5) * (Math.PI / 180);
-      ctx.save();
-      ctx.translate(w / 2, h / 2);
-      ctx.rotate(angle);
-      ctx.drawImage(img, -w / 2, -h / 2, w, h);
-      ctx.restore();
+      ctx.drawImage(img, 0, 0, w, h);
 
       // Imperceptible colour correction
       const imageData = ctx.getImageData(0, 0, w, h);
@@ -207,16 +201,13 @@ async function uniqualizeVideo(file, copyIndex, onFFmpegProgress) {
   const brightness = randomBetween(-0.01, 0.01).toFixed(4);
   const contrast   = randomBetween(0.99, 1.01).toFixed(4);
   const saturation = randomBetween(0.98, 1.02).toFixed(4);
-  const speed      = randomBetween(0.99, 1.01).toFixed(4);
-  const pitch      = randomBetween(0.995, 1.005).toFixed(4);
 
   // FIX 5: -map 0:a? делает аудио опциональным (не падает если нет звука)
   const exitCode = await ff.exec([
     "-i", inputName,
-    "-vf", `eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation},setpts=${(1 / speed).toFixed(4)}*PTS`,
+    "-vf", `eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`,
     "-map", "0:v:0",
     "-map", "0:a?",
-    "-af", `asetrate=44100*${pitch},aresample=44100,atempo=${speed}`,
     "-map_metadata", "-1",
     "-metadata", `comment=uq${copyIndex}_${Math.random().toString(36).slice(2)}`,
     "-c:v", "libx264",
@@ -234,8 +225,8 @@ async function uniqualizeVideo(file, copyIndex, onFFmpegProgress) {
   const blob = new Blob([new Uint8Array(data)], { type: "video/mp4" });
 
   // Чистим виртуальную FS
-  try { await ff.deleteFile(inputName); } catch (_) {}
-  try { await ff.deleteFile(outputName); } catch (_) {}
+  try { await ff.deleteFile(inputName); } catch { /* ignore */ }
+  try { await ff.deleteFile(outputName); } catch { /* ignore */ }
 
   return blob;
 }
@@ -512,7 +503,7 @@ export default function App() {
   const handleCancel = () => {
     cancelRef.current = true;
     if (ffmpegInstance) {
-      try { ffmpegInstance.terminate(); } catch (_) {}
+      try { ffmpegInstance.terminate(); } catch { /* ignore */ }
       ffmpegInstance = null;
       ffmpegLoaded = false;
       ffmpegLoadedRef.current = false;
@@ -892,7 +883,7 @@ export default function App() {
 
           <div style={S.infoGrid}>
             {[
-              { icon: "🖼", title: "Изображения", desc: "Canvas API — поворот, цвет, шум, очистка EXIF" },
+              { icon: "🖼", title: "Изображения", desc: "Canvas API — цвет, шум, очистка EXIF" },
               { icon: "🎬", title: "Видео", desc: "ffmpeg.wasm — полная обработка прямо в браузере" },
               { icon: "🧹", title: "Метаданные", desc: "Полная очистка через -map_metadata -1" },
               { icon: "🎨", title: "Цветокоррекция", desc: "Яркость, контраст, насыщенность ±1%" },
