@@ -135,6 +135,25 @@ async function compressVideo(file, targetBytes, onProgress) {
   return { blob, warning };
 }
 
+async function extractSubtitles(file) {
+  const ff  = await getFFmpeg();
+  const inp = uniqueName("sin", ext(file));
+  const out = uniqueName("sout", ".srt");
+
+  try {
+    await ff.writeFile(inp, await fetchFile(file));
+
+    const code = await ff.exec(["-i", inp, "-map", "0:s:0", "-c:s", "srt", "-y", out]);
+    if (code !== 0) throw new Error(`В видео «${file.name}» нет встроенных субтитров`);
+
+    const data = await ff.readFile(out);
+    return new Blob([new Uint8Array(data)], { type: "text/srt" });
+  } finally {
+    try { await ff.deleteFile(inp); } catch { /* ignore */ }
+    try { await ff.deleteFile(out); } catch { /* ignore */ }
+  }
+}
+
 // ─── Image uniqualization ─────────────────────────────────────────────────────
 async function uniqualizeImage(file) {
   return new Promise((resolve, reject) => {
@@ -201,11 +220,15 @@ async function uniqualizeVideo(file, copyIndex, onFFmpegProgress) {
   const brightness = randomBetween(-0.01, 0.01).toFixed(4);
   const contrast   = randomBetween(0.99, 1.01).toFixed(4);
   const saturation = randomBetween(0.98, 1.02).toFixed(4);
+  const noiseStrength = Math.round(randomBetween(3, 7));
+  const blurRadius = Math.round(randomBetween(1, 2));
+
+  const vf = `eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation},noise=alls=${noiseStrength}:allf=t+u,boxblur=${blurRadius}:1`;
 
   // FIX 5: -map 0:a? делает аудио опциональным (не падает если нет звука)
   const exitCode = await ff.exec([
     "-i", inputName,
-    "-vf", `eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`,
+    "-vf", vf,
     "-map", "0:v:0",
     "-map", "0:a?",
     "-map_metadata", "-1",
@@ -255,6 +278,8 @@ export default function App() {
   const [compDone, setCompDone]               = useState(false);
   const [compError, setCompError]             = useState("");
   const [compWarning, setCompWarning]         = useState("");
+  const [subStatus, setSubStatus]             = useState({}); // fileId -> "working" | "done" | error message
+  const [subExtracting, setSubExtracting]     = useState(false);
   const compDropRef  = useRef(null);
   const compInputRef = useRef(null);
   const cancelRef    = useRef(false);
@@ -336,7 +361,7 @@ export default function App() {
 
   const handleProcess = async () => {
     if (!creatives.length) return;
-    if (compProcessing || folderProcessing || batchProcessing) {
+    if (compProcessing || folderProcessing || batchProcessing || subExtracting) {
       setError("Дождись окончания обработки.");
       return;
     }
@@ -420,7 +445,14 @@ export default function App() {
     addCompFiles(e.dataTransfer.files);
   };
 
-  const removeCompFile = (id) => setCompFiles(prev => prev.filter(c => c.id !== id));
+  const removeCompFile = (id) => {
+    setCompFiles(prev => prev.filter(c => c.id !== id));
+    setSubStatus(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
 
   const resolveTargetBytes = (file) => {
     if (compMode === "optimal") return file.size * 0.60;
@@ -434,6 +466,10 @@ export default function App() {
     if (!compFiles.length) return;
     if (processing) {
       setCompError("Дождись окончания уникализации на вкладке «Уникализация».");
+      return;
+    }
+    if (subExtracting) {
+      setCompError("Дождись окончания извлечения субтитров.");
       return;
     }
     if (!ffmpegReady) {
@@ -500,6 +536,32 @@ export default function App() {
     setCompProgress({ current: 0, total: 0, label: "", videoPct: 0 });
   };
 
+  const handleExtractSubs = async (id, file) => {
+    if (processing || compProcessing || folderProcessing || batchProcessing || subExtracting) {
+      setSubStatus(prev => ({ ...prev, [id]: "Дождись окончания обработки на другой вкладке." }));
+      return;
+    }
+    if (!ffmpegReady) {
+      setSubStatus(prev => ({ ...prev, [id]: ffmpegError
+        ? "ffmpeg.wasm не загружен — нажми «Повторить» выше."
+        : "ffmpeg.wasm ещё загружается, подожди..." }));
+      return;
+    }
+    setSubExtracting(true);
+    setSubStatus(prev => ({ ...prev, [id]: "working" }));
+    try {
+      const blob = await extractSubtitles(file);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `${baseName(file)}.srt`; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setSubStatus(prev => ({ ...prev, [id]: "done" }));
+    } catch (e) {
+      setSubStatus(prev => ({ ...prev, [id]: e.message }));
+    }
+    setSubExtracting(false);
+  };
+
   const handleCancel = () => {
     cancelRef.current = true;
     if (ffmpegInstance) {
@@ -560,7 +622,7 @@ export default function App() {
   const handleBatchProcess = async () => {
     const validDirs = batchDirs.filter(d => d.files.length > 0);
     if (!validDirs.length) { setBatchError("Нет папок с медиафайлами."); return; }
-    if (processing || compProcessing || folderProcessing) {
+    if (processing || compProcessing || folderProcessing || subExtracting) {
       setBatchError("Дождись окончания обработки на другой вкладке.");
       return;
     }
@@ -638,7 +700,7 @@ export default function App() {
 
   const handleFolderProcess = async () => {
     if (!folderDir || !folderDir.files.length) { setFolderError("Папка пуста или не выбрана."); return; }
-    if (processing || compProcessing || batchProcessing) {
+    if (processing || compProcessing || batchProcessing || subExtracting) {
       setFolderError("Дождись окончания обработки на другой вкладке.");
       return;
     }
@@ -970,7 +1032,7 @@ export default function App() {
             <div style={S.list}>
               <div style={S.listHeader}>
                 <span>Видео: {compFiles.length} файлов</span>
-                <button style={S.clearBtn} onClick={() => setCompFiles([])}>Очистить</button>
+                <button style={S.clearBtn} onClick={() => { setCompFiles([]); setSubStatus({}); }}>Очистить</button>
               </div>
               {compFiles.map(c => (
                 <div key={c.id} style={S.item}>
@@ -982,7 +1044,21 @@ export default function App() {
                       → {((c.file.size / 1024 / 1024) * (compMode === "optimal" ? 0.6 : 0.2)).toFixed(1)} МБ
                     </div>
                   )}
+                  <button
+                    style={S.removeBtn}
+                    title="Извлечь встроенные субтитры (.srt)"
+                    disabled={subStatus[c.id] === "working"}
+                    onClick={() => handleExtractSubs(c.id, c.file)}
+                  >
+                    {subStatus[c.id] === "working" ? "…" : "💬"}
+                  </button>
                   <button style={S.removeBtn} onClick={() => removeCompFile(c.id)}>✕</button>
+                  {subStatus[c.id] && subStatus[c.id] !== "working" && subStatus[c.id] !== "done" && (
+                    <div style={S.itemSubError}>⚠️ {subStatus[c.id]}</div>
+                  )}
+                  {subStatus[c.id] === "done" && (
+                    <div style={S.itemSubDone}>✅ Субтитры скачаны</div>
+                  )}
                 </div>
               ))}
             </div>
@@ -1142,6 +1218,8 @@ const S = {
   copiesInput: { width: 44, textAlign: "center", background: "#0a0a14", border: "1px solid #2a2a4a", color: "#e8e8f0", borderRadius: 6, padding: "3px 4px", fontSize: 13, fontFamily: "'Courier New', monospace" },
   copiesLabel: { fontSize: 11, color: "#4a4a6a", marginLeft: 2 },
   removeBtn: { background: "none", border: "none", color: "#3a3a5a", cursor: "pointer", fontSize: 14, padding: 4 },
+  itemSubError: { width: "100%", fontSize: 11, color: "#ff5c5c" },
+  itemSubDone: { width: "100%", fontSize: 11, color: "#4ade80" },
   processBtn: { width: "100%", padding: "14px 0", background: "linear-gradient(90deg, #00e5ff22, #7c4dff22)", border: "1px solid #7c4dff", color: "#e8e8f0", borderRadius: 10, fontSize: 15, letterSpacing: 2, fontFamily: "'Courier New', monospace", fontWeight: 700, marginBottom: 24 },
   progressWrap: { marginBottom: 24, padding: 16, background: "#0f0f1a", borderRadius: 10, border: "1px solid #1e1e3a" },
   progressLabel: { fontSize: 12, color: "#6b6b8a", marginBottom: 8 },
